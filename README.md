@@ -2,7 +2,7 @@
 
 A lightweight, fast secrets scanner written in Go for Non-Human Identity (NHI) governance workflows.
 
-Scans local directories or all repositories on a self-hosted Gitea instance for hardcoded credentials, API keys, tokens, and other secrets that represent unmanaged non-human identities.
+Scans local directories or all repositories on a self-hosted Gitea instance for hardcoded credentials, API keys, tokens, and other secrets that represent unmanaged non-human identities. Includes a dark-mode PWA dashboard accessible from any device on your network or over Tailscale.
 
 ---
 
@@ -16,11 +16,15 @@ In NHI governance terms, every hardcoded credential is an unmanaged non-human id
 
 ## Features
 
-- Scans local directories or all repos on a Gitea instance
+- Scans local directories or all repos on a self-hosted Gitea instance
 - 13 built-in detection patterns covering AWS, GitHub, Stripe, SendGrid, Slack, database URLs, private keys, bearer tokens, and more
+- High-risk pattern classification (AWS keys, GitHub tokens, private keys, Stripe keys) with red alerts
 - Gitea mode: pulls repo list via API, clones each repo to a temp dir, scans, and cleans up automatically
+- PWA dashboard: dark-mode web UI with repo status cards, findings trend chart, report history, and raw log viewer
+- Installable as a home screen app on iOS and Android via Tailscale
 - Skips binary files, build artifacts, and dependency directories (`venv`, `node_modules`, `vendor`, etc.)
 - Dated report output for audit trails
+- Runs as a systemd service on a Raspberry Pi
 - Single static binary — no runtime dependencies
 
 ---
@@ -42,6 +46,7 @@ go build -o nhiscanner main.go
 ```bash
 GOOS=linux GOARCH=arm64 go build -o nhiscanner main.go
 scp nhiscanner user@your-pi:/home/user/nhiscanner
+chmod +x /home/user/nhiscanner
 ```
 
 ---
@@ -71,25 +76,40 @@ The scanner will:
 4. Print findings grouped by repo
 5. Delete the temp directory
 
+### Dashboard mode
+
+Serve the PWA dashboard:
+
+```bash
+./nhiscanner --serve 3300 /path/to/reports
+```
+
+Then open `http://your-pi:3300` in any browser. On iOS/Android, tap Share → Add to Home Screen to install as a PWA.
+
+The dashboard shows:
+- Metric cards: repos scanned, clean count, total findings, high-risk count
+- Red alert box for high-risk findings (AWS keys, GitHub tokens, private keys)
+- Repo status grid with green/amber/red color coding
+- Findings trend bar chart across all historical scans
+- Report history with tap-to-expand raw log viewer
+
 ---
 
 ## Configuration
 
-For production use, store tokens in an env file rather than passing them as arguments:
+Store tokens in an env file rather than passing them as arguments:
 
 ```bash
-# ~/.nhiscanner.env
+cat > ~/.nhiscanner.env << 'EOF'
 GITEA_URL=http://your-gitea-host:3200
 GITEA_TOKEN=your_gitea_token
 GITHUB_TOKEN=your_github_token
-```
-
-Restrict permissions:
-```bash
+EOF
 chmod 600 ~/.nhiscanner.env
 ```
 
 Use a wrapper script for cron:
+
 ```bash
 #!/bin/bash
 source ~/.nhiscanner.env
@@ -108,22 +128,54 @@ Run nightly at 2am, write dated reports:
 
 ---
 
+## Running as a systemd service (Raspberry Pi)
+
+Create `/etc/systemd/system/nhi-dashboard.service`:
+
+```ini
+[Unit]
+Description=NHI Scanner Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=your-user
+EnvironmentFile=/home/your-user/.nhiscanner.env
+ExecStart=/home/your-user/nhiscanner --serve 3300 /home/your-user/reports
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+
+```bash
+sudo systemctl enable nhi-dashboard
+sudo systemctl start nhi-dashboard
+```
+
+Access over Tailscale from anywhere: `http://your-tailscale-ip:3300`
+
+---
+
 ## Detection patterns
 
-| Pattern | Examples caught |
-|---|---|
-| AWS Access Key | `AKIA...` |
-| AWS Secret Key | `aws_secret_access_key = ...` |
-| GitHub Token | `ghp_...`, `gho_...` |
-| Generic API Key | `api_key = ...`, `apikey: ...` |
-| Generic Secret | `password = ...`, `secret = ...` |
-| Private Key Header | `-----BEGIN RSA PRIVATE KEY-----` |
-| Bearer Token | `Authorization: Bearer ...` |
-| Basic Auth in URL | `https://user:pass@host` |
-| Database URL | `postgres://...`, `mongodb://...` |
-| Slack Token | `xoxb-...`, `xoxp-...` |
-| Stripe Key | `sk_live_...` |
-| SendGrid Key | `SG....` |
+| Pattern | Examples caught | Risk level |
+|---|---|---|
+| AWS Access Key | `AKIA...` | High |
+| AWS Secret Key | `aws_secret_access_key = ...` | High |
+| GitHub Token | `ghp_...`, `gho_...` | High |
+| Private Key Header | `-----BEGIN RSA PRIVATE KEY-----` | High |
+| Stripe Key | `sk_live_...` | High |
+| Generic API Key | `api_key = ...`, `apikey: ...` | Medium |
+| Generic Secret | `password = ...`, `secret = ...` | Medium |
+| Bearer Token | `Authorization: Bearer ...` | Medium |
+| Basic Auth in URL | `https://user:pass@host` | Medium |
+| Database URL | `postgres://...`, `mongodb://...` | Medium |
+| Slack Token | `xoxb-...`, `xoxp-...` | Medium |
+| SendGrid Key | `SG....` | Medium |
 
 ---
 
@@ -132,8 +184,24 @@ Run nightly at 2am, write dated reports:
 - [ ] Allowlist / false positive suppression
 - [ ] JSON report output
 - [ ] v2: Live service account auditor — verify discovered credentials against their APIs to confirm active, scoped, unrotated non-human identities
-- [ ] Webhook alert on new findings
+- [ ] Webhook / push notification on new high-risk findings
 - [ ] GitHub Actions integration
+
+---
+
+## Architecture
+
+```
+goNHIscanner
+├── Local mode      scan any directory on disk
+├── Gitea mode      pull repo list via API → clone → scan → cleanup
+└── Dashboard mode  serve PWA on :3300, reads dated report files
+                    ├── /              dark-mode HTML dashboard
+                    ├── /manifest.json PWA manifest
+                    └── /api/reports   JSON API for report data
+```
+
+The scanner runs nightly via cron, writes dated `.txt` reports, and the dashboard reads them at request time — no database required.
 
 ---
 

@@ -51,7 +51,7 @@ var patterns = map[string]*regexp.Regexp{
 	"GitHub Token":       regexp.MustCompile(`ghp_[A-Za-z0-9]{36}`),
 	"GitHub OAuth":       regexp.MustCompile(`gho_[A-Za-z0-9]{36}`),
 	"Private Key Header": regexp.MustCompile(`-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----`),
-	"Bearer Token":       regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*`),
+	"Bearer Token":       regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*`), // nhiignore
 	"Basic Auth in URL":  regexp.MustCompile(`https?://[^/\s]+:[^/\s@]+@[^/\s]+`),
 	"Slack Token":        regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]+`),
 	"Stripe Key":         regexp.MustCompile(`sk_live_[A-Za-z0-9]{24}`),
@@ -94,6 +94,12 @@ func scanFile(path string) ([]Finding, error) {
 	for scanner.Scan() {
 		lineNum++
 		line := scanner.Text()
+
+		if strings.HasSuffix(strings.TrimSpace(line), "// nhiignore") ||
+			strings.HasSuffix(strings.TrimSpace(line), "# nhiignore") {
+			continue
+		}
+
 		for patternName, re := range patterns {
 			if match := re.FindString(line); match != "" {
 				display := match
@@ -215,7 +221,7 @@ func runScan(giteaURL, token string) []RepoResult {
 			results = append(results, RepoResult{Name: repo.Name, Error: err.Error()})
 			continue
 		}
-		cloneURL := strings.Replace(repo.CloneURL, "http://", fmt.Sprintf("http://scanner:%s@", token), 1)
+		cloneURL := strings.Replace(repo.CloneURL, "http://", fmt.Sprintf("http://scanner:%s@", token), 1) // nhiignore
 		cmd := exec.Command("git", "clone", "--depth=1", cloneURL, tmpDir)
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
@@ -587,7 +593,7 @@ func scanGitea(giteaURL, token string) {
 			fmt.Printf("  Could not create temp dir: %v\n", err)
 			continue
 		}
-		cloneURL := strings.Replace(repo.CloneURL, "http://", fmt.Sprintf("http://scanner:%s@", token), 1)
+		cloneURL := strings.Replace(repo.CloneURL, "http://", fmt.Sprintf("http://scanner:%s@", token), 1) // nhiignore
 		cmd := exec.Command("git", "clone", "--depth=1", cloneURL, tmpDir)
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard

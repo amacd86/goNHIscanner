@@ -112,12 +112,49 @@ func scanFile(path string) ([]Finding, error) {
 	return findings, scanner.Err()
 }
 
+func loadNHIIgnore(root string) []string {
+	ignorePath := filepath.Join(root, ".nhiignore")
+	content, err := os.ReadFile(ignorePath)
+	if err != nil {
+		return nil
+	}
+	var patterns []string
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		patterns = append(patterns, line)
+	}
+	return patterns
+}
+
+func isIgnored(path, root string, ignorePatterns []string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	for _, pattern := range ignorePatterns {
+		matched, err := filepath.Match(pattern, rel)
+		if err == nil && matched {
+			return true
+		}
+		if strings.HasPrefix(rel, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 func scanDirectory(root string) ([]Finding, error) {
 	var allFindings []Finding
+	ignorePatterns := loadNHIIgnore(root)
+
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
+
 		base := filepath.Base(path)
 		if strings.HasPrefix(base, ".") && info.IsDir() {
 			return filepath.SkipDir
@@ -131,6 +168,10 @@ func scanDirectory(root string) ([]Finding, error) {
 		if skipExtensions[strings.ToLower(filepath.Ext(path))] {
 			return nil
 		}
+		if isIgnored(path, root, ignorePatterns) {
+			return nil
+		}
+
 		findings, err := scanFile(path)
 		if err != nil {
 			return nil
@@ -138,6 +179,7 @@ func scanDirectory(root string) ([]Finding, error) {
 		allFindings = append(allFindings, findings...)
 		return nil
 	})
+
 	return allFindings, err
 }
 

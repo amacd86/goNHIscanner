@@ -16,6 +16,8 @@ import (
 	"time"
 )
 
+// ── Types ────────────────────────────────────────────────────────────────────
+
 type Finding struct {
 	File    string
 	Line    int
@@ -42,6 +44,32 @@ type ScanReport struct {
 	Total   int
 	RawText string
 }
+
+type VerificationStatus string
+
+const (
+	StatusActive  VerificationStatus = "ACTIVE"
+	StatusExpired VerificationStatus = "EXPIRED"
+	StatusUnknown VerificationStatus = "UNKNOWN"
+	StatusError   VerificationStatus = "ERROR"
+)
+
+type VerificationResult struct {
+	Status VerificationStatus
+	Detail string
+	Risk   string
+}
+
+type AuditFinding struct {
+	Repo    string
+	File    string
+	Line    int
+	Pattern string
+	Match   string
+	Result  VerificationResult
+}
+
+// ── Patterns ─────────────────────────────────────────────────────────────────
 
 var patterns = map[string]*regexp.Regexp{
 	"AWS Access Key":     regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
@@ -81,6 +109,8 @@ var skipDirs = map[string]bool{
 	".venv": true, "__pycache__": true, ".idea": true,
 	"dist": true, "build": true, "venv": true,
 }
+
+// ── Scanner ───────────────────────────────────────────────────────────────────
 
 func scanFile(path string) ([]Finding, error) {
 	var findings []Finding
@@ -160,7 +190,6 @@ func scanDirectory(root string) ([]Finding, error) {
 		if err != nil {
 			return nil
 		}
-
 		base := filepath.Base(path)
 		if strings.HasPrefix(base, ".") && info.IsDir() {
 			return filepath.SkipDir
@@ -177,7 +206,6 @@ func scanDirectory(root string) ([]Finding, error) {
 		if isIgnored(path, root, ignorePatterns) {
 			return nil
 		}
-
 		findings, err := scanFile(path)
 		if err != nil {
 			return nil
@@ -185,9 +213,10 @@ func scanDirectory(root string) ([]Finding, error) {
 		allFindings = append(allFindings, findings...)
 		return nil
 	})
-
 	return allFindings, err
 }
+
+// ── Gitea ─────────────────────────────────────────────────────────────────────
 
 func getGiteaRepos(giteaURL, token string) ([]GiteaRepo, error) {
 	url := fmt.Sprintf("%s/api/v1/repos/search?limit=50&token=%s", giteaURL, token)
@@ -241,6 +270,8 @@ func runScan(giteaURL, token string) []RepoResult {
 	return results
 }
 
+// ── Report parser ─────────────────────────────────────────────────────────────
+
 func parseReportFile(path string) ScanReport {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -279,7 +310,6 @@ func parseReportFile(path string) ScanReport {
 	if currentRepo != nil {
 		repos = append(repos, *currentRepo)
 	}
-
 	return ScanReport{Date: date, Repos: repos, Total: total, RawText: raw}
 }
 
@@ -295,6 +325,182 @@ func loadReports(reportsDir string) []ScanReport {
 	}
 	return reports
 }
+
+// ── Verifiers ─────────────────────────────────────────────────────────────────
+
+func verifyGitHubToken(token string) VerificationResult {
+	req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("User-Agent", "goNHIscanner")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return VerificationResult{Status: StatusError, Detail: err.Error(), Risk: "Unknown"}
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+		body, _ := io.ReadAll(resp.Body)
+		var user struct {
+			Login string `json:"login"`
+		}
+		json.Unmarshal(body, &user)
+		scopes := resp.Header.Get("X-OAuth-Scopes")
+		return VerificationResult{
+			Status: StatusActive,
+			Detail: fmt.Sprintf("Authenticated as %s — scopes: %s", user.Login, scopes),
+			Risk:   "HIGH",
+		}
+	case 401:
+		return VerificationResult{Status: StatusExpired, Detail: "Token invalid or revoked", Risk: "Low"}
+	default:
+		return VerificationResult{Status: StatusUnknown, Detail: fmt.Sprintf("HTTP %d", resp.StatusCode), Risk: "Unknown"}
+	}
+}
+
+func verifyStripeKey(key string) VerificationResult {
+	req, _ := http.NewRequest("GET", "https://api.stripe.com/v1/account", nil)
+	req.SetBasicAuth(key, "")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return VerificationResult{Status: StatusError, Detail: err.Error(), Risk: "Unknown"}
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+		return VerificationResult{Status: StatusActive, Detail: "Stripe key is live", Risk: "CRITICAL"}
+	case 401:
+		return VerificationResult{Status: StatusExpired, Detail: "Stripe key invalid or revoked", Risk: "Low"}
+	default:
+		return VerificationResult{Status: StatusUnknown, Detail: fmt.Sprintf("HTTP %d", resp.StatusCode), Risk: "Unknown"}
+	}
+}
+
+func verifyAWSKey(accessKey string) VerificationResult {
+	if strings.HasPrefix(accessKey, "AKIA") && len(accessKey) == 20 {
+		return VerificationResult{
+			Status: StatusUnknown,
+			Detail: "AWS key format confirmed — manual verification required (STS signing not yet implemented)",
+			Risk:   "HIGH",
+		}
+	}
+	return VerificationResult{Status: StatusUnknown, Detail: "Could not parse AWS key", Risk: "Unknown"}
+}
+
+func runVerifier(pattern, match string) VerificationResult {
+	switch pattern {
+	case "GitHub Token", "GitHub OAuth":
+		re := regexp.MustCompile(`gh[po]_[A-Za-z0-9]{36}`)
+		if token := re.FindString(match); token != "" {
+			return verifyGitHubToken(token)
+		}
+	case "Stripe Key":
+		re := regexp.MustCompile(`sk_live_[A-Za-z0-9]{24}`)
+		if key := re.FindString(match); key != "" {
+			return verifyStripeKey(key)
+		}
+	case "AWS Access Key":
+		re := regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+		if key := re.FindString(match); key != "" {
+			return verifyAWSKey(key)
+		}
+	}
+	return VerificationResult{Status: StatusUnknown, Detail: "No verifier available for this pattern", Risk: "Unknown"}
+}
+
+// ── Audit mode ────────────────────────────────────────────────────────────────
+
+func runAudit(reportsDir string) {
+	files, err := filepath.Glob(filepath.Join(reportsDir, "nhi-*.txt"))
+	if err != nil || len(files) == 0 {
+		fmt.Println("No reports found in", reportsDir)
+		os.Exit(1)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(files)))
+	latestReport := files[0]
+
+	fmt.Printf("\nNHI Scanner - Audit Mode\n")
+	fmt.Printf("  Reading: %s\n", latestReport)
+	fmt.Println(strings.Repeat("─", 60))
+
+	report := parseReportFile(latestReport)
+
+	verifiablePatterns := map[string]bool{
+		"GitHub Token":   true,
+		"GitHub OAuth":   true,
+		"Stripe Key":     true,
+		"AWS Access Key": true,
+	}
+
+	var auditFindings []AuditFinding
+	for _, repo := range report.Repos {
+		for _, f := range repo.Findings {
+			if !verifiablePatterns[f.Pattern] {
+				continue
+			}
+			fmt.Printf("  Verifying [%s] in %s...\n", f.Pattern, repo.Name)
+			result := runVerifier(f.Pattern, f.Match)
+			auditFindings = append(auditFindings, AuditFinding{
+				Repo:    repo.Name,
+				File:    f.File,
+				Line:    f.Line,
+				Pattern: f.Pattern,
+				Match:   f.Match,
+				Result:  result,
+			})
+		}
+	}
+
+	fmt.Println()
+	fmt.Println(strings.Repeat("─", 60))
+
+	if len(auditFindings) == 0 {
+		fmt.Println("No verifiable credentials found in latest report.")
+		fmt.Println("(Generic secrets and passwords require manual review)")
+		return
+	}
+
+	activeCount := 0
+	for _, af := range auditFindings {
+		icon := "?"
+		switch af.Result.Status {
+		case StatusActive:
+			icon = "!!"
+			activeCount++
+		case StatusExpired:
+			icon = "ok"
+		case StatusError:
+			icon = "err"
+		}
+		fmt.Printf("[%s] %s — %s\n", icon, af.Pattern, af.Repo)
+		fmt.Printf("      Status: %s\n", af.Result.Status)
+		fmt.Printf("      Detail: %s\n", af.Result.Detail)
+		fmt.Printf("      Risk:   %s\n\n", af.Result.Risk)
+	}
+
+	fmt.Println(strings.Repeat("─", 60))
+	fmt.Printf("Verified %d credential(s) — %d ACTIVE\n\n", len(auditFindings), activeCount)
+
+	auditDate := time.Now().Format("2006-01-02")
+	auditPath := filepath.Join(reportsDir, fmt.Sprintf("audit-%s.txt", auditDate))
+	f, err := os.Create(auditPath)
+	if err == nil {
+		defer f.Close()
+		fmt.Fprintf(f, "NHI Scanner - Audit Report\n")
+		fmt.Fprintf(f, "Date: %s\n", auditDate)
+		fmt.Fprintf(f, "Source: %s\n", latestReport)
+		fmt.Fprintf(f, "%s\n\n", strings.Repeat("─", 60))
+		for _, af := range auditFindings {
+			fmt.Fprintf(f, "[%s] %s — %s\n", af.Result.Status, af.Pattern, af.Repo)
+			fmt.Fprintf(f, "  Detail: %s\n", af.Result.Detail)
+			fmt.Fprintf(f, "  Risk:   %s\n\n", af.Result.Risk)
+		}
+		fmt.Fprintf(f, "%s\n", strings.Repeat("─", 60))
+		fmt.Fprintf(f, "Total verified: %d — Active: %d\n", len(auditFindings), activeCount)
+		fmt.Printf("Audit report written to %s\n\n", auditPath)
+	}
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
 
 const dashboardHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -366,41 +572,34 @@ async function load() {
   const data = await res.json();
   render(data);
 }
-
 function render(data) {
   const app = document.getElementById('app');
   if (!data.reports || data.reports.length === 0) {
     app.innerHTML = '<div class="empty">No scan reports found yet. Reports appear after the nightly scan runs at 2am.</div>';
     return;
   }
-
   const latest = data.reports[0];
   document.getElementById('last-scan').textContent = 'Last scan: ' + (latest.date || 'unknown');
-
   const totalRepos = latest.repos ? latest.repos.length : 0;
   const cleanRepos = latest.repos ? latest.repos.filter(r => r.clean).length : 0;
   const highRisk = latest.high_risk_count || 0;
-
   let alertsHTML = '';
   if (highRisk > 0) {
     const items = (latest.high_risk_findings || []).map(f => '<div class="alert-item">' + esc(f) + '</div>').join('');
     alertsHTML = '<div class="alert-box"><div class="alert-title"><span class="alert-dot"></span>High-risk findings require immediate attention</div>' + items + '</div>';
   }
-
   const reposHTML = (latest.repos || []).map(r => {
     const cls = r.high_risk ? 'high-risk' : (r.clean ? 'clean' : 'has-findings');
     const sCls = r.high_risk ? 'danger' : (r.clean ? 'clean' : 'warn');
     const sTxt = r.clean ? 'Clean' : r.finding_count + ' finding(s)' + (r.high_risk ? ' — HIGH RISK' : '');
     return '<div class="repo-card ' + cls + '"><div class="repo-name">' + esc(r.name) + '</div><div class="repo-status ' + sCls + '">' + sTxt + '</div></div>';
   }).join('');
-
   const maxF = Math.max(...data.reports.map(r => r.total || 0), 1);
   const barsHTML = data.reports.slice(0, 14).reverse().map(r => {
     const h = Math.max(Math.round(((r.total || 0) / maxF) * 72), r.total > 0 ? 6 : 3);
     const d = (r.date || '').split('-').slice(1).join('/');
     return '<div class="bar-wrap"><div class="bar ' + (r.total === 0 ? 'zero' : '') + '" style="height:' + h + 'px" title="' + (r.total||0) + ' findings on ' + (r.date||'') + '"></div><div class="bar-label">' + d + '</div></div>';
   }).join('');
-
   const historyHTML = data.reports.map((r, i) => {
     const bCls = r.high_risk_count > 0 ? 'danger' : (r.total === 0 ? 'clean' : 'warn');
     const bTxt = r.total === 0 ? 'Clean' : r.total + ' findings';
@@ -411,7 +610,6 @@ function render(data) {
       '<div class="raw-view" id="raw-' + i + '">' + esc(r.raw_text||'') +
       '<button class="close-btn" onclick="event.stopPropagation();toggleRaw(' + i + ')">Close</button></div>';
   }).join('');
-
   app.innerHTML =
     '<div class="metrics">' +
       '<div class="metric"><div class="label">Repos scanned</div><div class="value">' + totalRepos + '</div></div>' +
@@ -427,15 +625,12 @@ function render(data) {
     '<div class="section-title">Report history</div>' +
     '<div class="history">' + historyHTML + '</div>';
 }
-
 function toggleRaw(i) {
   document.getElementById('raw-' + i).classList.toggle('open');
 }
-
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
-
 load();
 </script>
 </body>
@@ -455,9 +650,10 @@ const manifestJSON = `{
   ]
 }`
 
+// ── Dashboard server ──────────────────────────────────────────────────────────
+
 func serveAPIReports(reportsDir string, w http.ResponseWriter, r *http.Request) {
 	reports := loadReports(reportsDir)
-
 	type RepoJSON struct {
 		Name         string `json:"name"`
 		Clean        bool   `json:"clean"`
@@ -472,7 +668,6 @@ func serveAPIReports(reportsDir string, w http.ResponseWriter, r *http.Request) 
 		HighRiskFindings []string   `json:"high_risk_findings"`
 		RawText          string     `json:"raw_text"`
 	}
-
 	var out []ReportJSON
 	for _, rep := range reports {
 		var repoJSON []RepoJSON
@@ -503,7 +698,6 @@ func serveAPIReports(reportsDir string, w http.ResponseWriter, r *http.Request) 
 			RawText:          rep.RawText,
 		})
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"reports": out})
 }
@@ -512,7 +706,6 @@ func serveDashboard(reportsDir string, port string) {
 	fmt.Printf("\nNHI Scanner Dashboard\n")
 	fmt.Printf("  Serving on http://0.0.0.0:%s\n", port)
 	fmt.Printf("  Reports dir: %s\n\n", reportsDir)
-
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprint(w, dashboardHTML)
@@ -568,12 +761,13 @@ func serveDashboard(reportsDir string, port string) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"status":"scan started"}`)
 	})
-
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
 	}
 }
+
+// ── Gitea scan mode ───────────────────────────────────────────────────────────
 
 func scanGitea(giteaURL, token string) {
 	fmt.Printf("\nNHI Scanner - Gitea Mode\n")
@@ -621,6 +815,8 @@ func scanGitea(giteaURL, token string) {
 	fmt.Printf("Total findings across all repos: %d\n\n", totalFindings)
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
+
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "--serve" {
 		port := "3300"
@@ -634,10 +830,21 @@ func main() {
 		serveDashboard(reportsDir, port)
 		return
 	}
+
+	if len(os.Args) >= 2 && os.Args[1] == "--audit" {
+		reportsDir := "/home/gus/reports"
+		if len(os.Args) >= 3 {
+			reportsDir = os.Args[2]
+		}
+		runAudit(reportsDir)
+		return
+	}
+
 	if len(os.Args) == 4 && os.Args[1] == "--gitea" {
 		scanGitea(os.Args[2], os.Args[3])
 		return
 	}
+
 	scanPath := "."
 	if len(os.Args) > 1 {
 		scanPath = os.Args[1]

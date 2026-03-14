@@ -22,6 +22,7 @@ In NHI governance terms, every hardcoded credential is an unmanaged non-human id
 - Gitea mode: pulls repo list via API, clones each repo to a temp dir, scans, and cleans up automatically
 - PWA dashboard: dark-mode web UI with repo status cards, findings trend chart, report history, and raw log viewer
 - Installable as a home screen app on iOS and Android via Tailscale
+- False positive suppression via `.nhiignore` files and inline `// nhiignore` comments
 - Skips binary files, build artifacts, and dependency directories (`venv`, `node_modules`, `vendor`, etc.)
 - Dated report output for audit trails
 - Runs as a systemd service on a Raspberry Pi
@@ -92,6 +93,48 @@ The dashboard shows:
 - Repo status grid with green/amber/red color coding
 - Findings trend bar chart across all historical scans
 - Report history with tap-to-expand raw log viewer
+
+---
+
+## Suppressing false positives
+
+### File-level suppression with `.nhiignore`
+
+Add a `.nhiignore` file to any repo root to skip files or directories entirely:
+
+```
+# .nhiignore
+
+# Skip documentation files
+README.md
+docs/
+
+# Skip test fixtures
+tests/fixtures/
+```
+
+Lines starting with `#` are treated as comments. Paths are matched relative to the repo root. Directory prefixes are matched automatically — `docs/` will skip everything under `docs/`.
+
+### Line-level suppression with inline comments
+
+Add `// nhiignore` (Go, JS, etc.) or `# nhiignore` (Python, shell, etc.) to the end of any line to suppress findings on that specific line:
+
+```go
+// Pattern definition in scanner source — not a real credential
+"Bearer Token": regexp.MustCompile(`(?i)bearer\s+...`), // nhiignore
+```
+
+```python
+# Reading from env var, not a hardcoded secret — acknowledged
+PASSWORD = os.environ.get('DB_PASSWORD')  # nhiignore
+```
+
+```javascript
+// DOM input field, not a credential
+const password = document.getElementById('password').value; // nhiignore
+```
+
+This mirrors the `// nolint` pattern in Go and `# noqa` in Python — a deliberate, visible acknowledgment that the finding has been reviewed.
 
 ---
 
@@ -181,7 +224,6 @@ Access over Tailscale from anywhere: `http://your-tailscale-ip:3300`
 
 ## Roadmap
 
-- [ ] Allowlist / false positive suppression
 - [ ] JSON report output
 - [ ] v2: Live service account auditor — verify discovered credentials against their APIs to confirm active, scoped, unrotated non-human identities
 - [ ] Webhook / push notification on new high-risk findings
@@ -202,6 +244,8 @@ goNHIscanner
 ```
 
 The scanner runs nightly via cron, writes dated `.txt` reports, and the dashboard reads them at request time — no database required.
+
+False positives are suppressed at two levels: `.nhiignore` files skip entire paths, and inline `// nhiignore` comments suppress individual lines. Both are explicit acknowledgments that a finding has been reviewed.
 
 ---
 
